@@ -110,7 +110,9 @@ class SyncCollectionHandler(anki.sync.Syncer):
 
     # ankidesktop >=2.1rc2 sends graves in applyGraves, but still expects
     # server-side deletions to be returned by start
-    def start(self, minUsn, lnewer, graves={"cards": [], "notes": [], "decks": []}):
+    def start(self, minUsn, lnewer, graves={"cards": [], "notes": [], "decks": []}, offset=None):
+        if offset is not None:
+            raise NotImplementedError('You are using the experimental V2 scheduler, which is not supported by the server.')
         self.maxUsn = self.col._usn
         self.minUsn = minUsn
         self.lnewer = not lnewer
@@ -137,8 +139,9 @@ class SyncCollectionHandler(anki.sync.Syncer):
     def finish(self, mod=None):
         return anki.sync.Syncer.finish(self, anki.utils.intTime(1000))
 
-    # Syncer.removed() doesn't use self.usnLim() in queries, so we have to
-    # replace "usn=-1" by hand
+    # This function had to be put here in its entirety because Syncer.removed()
+    # doesn't use self.usnLim() (which we override in this class) in queries.
+    # "usn=-1" has been replaced with "usn >= ?", self.minUsn by hand.
     def removed(self):
         cards = []
         notes = []
@@ -170,11 +173,11 @@ class SyncCollectionHandler(anki.sync.Syncer):
         return [t for t, usn in self.col.tags.allItems()
                 if usn >= self.minUsn]
 
-class SyncMediaHandler(anki.sync.MediaSyncer):
+class SyncMediaHandler:
     operations = ['begin', 'mediaChanges', 'mediaSanity', 'uploadChanges', 'downloadFiles']
 
     def __init__(self, col):
-        anki.sync.MediaSyncer.__init__(self, col)
+        self.col = col
 
     def begin(self, skey):
         return {
@@ -194,11 +197,6 @@ class SyncMediaHandler(anki.sync.MediaSyncer):
         with zipfile.ZipFile(io.BytesIO(data), "r") as z:
             self._check_zip_data(z)
             processed_count = self._adopt_media_changes_from_zip(z)
-
-        # We increment our lastUsn once for each file we processed.
-        # (lastUsn - processed_count) must equal the client's lastUsn.
-        our_last_usn = self.col.media.lastUsn()
-        self.col.media.setLastUsn(our_last_usn + processed_count)
 
         return {
             'data': [processed_count, self.col.media.lastUsn()],
@@ -237,6 +235,8 @@ class SyncMediaHandler(anki.sync.MediaSyncer):
 
         # Add media files that were added on the client.
         media_to_add = []
+        usn = self.col.media.lastUsn()
+        oldUsn = usn
         for i in zip_file.infolist():
             if i.filename == "_meta":  # Ignore previously retrieved metadata.
                 continue
@@ -249,9 +249,9 @@ class SyncMediaHandler(anki.sync.MediaSyncer):
             # Save file to media directory.
             with open(file_path, 'wb') as f:
                 f.write(file_data)
-            mtime = self.col.media._mtime(file_path)
 
-            media_to_add.append((filename, csum, mtime, 0))
+            usn += 1
+            media_to_add.append((filename, usn, csum))
 
         # We count all files we are to remove, even if we don't have them in
         # our media directory and our db doesn't know about them.
@@ -264,8 +264,10 @@ class SyncMediaHandler(anki.sync.MediaSyncer):
 
         if media_to_add:
             self.col.media.db.executemany(
-                "INSERT OR REPLACE INTO media VALUES (?,?,?,?)", media_to_add)
+                "INSERT OR REPLACE INTO media VALUES (?,?,?)", media_to_add)
+            self.col.media.db.commit()
 
+        assert self.col.media.lastUsn() == oldUsn + processed_count  # TODO: move to some unit test
         return processed_count
 
     @staticmethod
@@ -288,18 +290,11 @@ class SyncMediaHandler(anki.sync.MediaSyncer):
         Marks all files in list filenames as deleted and removes them from the
         media directory.
         """
-
-        # Mark the files as deleted in our db.
-        self.col.media.db.executemany("UPDATE media " +
-                                      "SET csum = NULL " +
-                                      " WHERE fname = ?",
-                                      [(f, ) for f in filenames])
-
-        # Remove the files from our media directory if it is present.
         logger.debug('Removing %d files from media dir.' % len(filenames))
         for filename in filenames:
             try:
-                os.remove(os.path.join(self.col.media.dir(), filename))
+                self.col.media.syncDelete(filename)
+                self.col.media.db.commit()
             except OSError as err:
                 logger.error("Error when removing file '%s' from media dir: "
                               "%s" % (filename, str(err)))
@@ -325,12 +320,16 @@ class SyncMediaHandler(anki.sync.MediaSyncer):
 
     def mediaChanges(self, lastUsn):
         result = []
-        usn = self.col.media.lastUsn()
+        server_lastUsn = self.col.media.lastUsn()
         fname = csum = None
 
-        if lastUsn < usn or lastUsn == 0:
-            for fname,mtime,csum, in self.col.media.db.execute("select fname,mtime,csum from media"):
+        if lastUsn < server_lastUsn or lastUsn == 0:
+            for fname,usn,csum, in self.col.media.db.execute("select fname,usn,csum from media order by usn desc limit ?", server_lastUsn - lastUsn):
                 result.append([fname, usn, csum])
+
+        # anki assumes server_lastUsn == result[-1][1]
+        # ref: anki/sync.py:720 (commit cca3fcb2418880d0430a5c5c2e6b81ba260065b7)
+        result.reverse()
 
         return {'data': result, 'err': ''}
 
@@ -641,6 +640,8 @@ def make_app(global_conf, **local_conf):
 
 def main():
     logging.basicConfig(level=logging.INFO, format="[%(asctime)s]:%(levelname)s:%(name)s:%(message)s")
+    import ankisyncd
+    logger.info("ankisyncd {} ({})".format(ankisyncd._get_version(), ankisyncd._homepage))
     from wsgiref.simple_server import make_server, WSGIRequestHandler
     from ankisyncd.thread import shutdown
     import ankisyncd.config
